@@ -8228,7 +8228,7 @@ local function executeIY(plr)
 	if not getgenv().PLUGIN_ISKeepInfYield and KeepInfYield and (not TeleportCheck) and queueteleport then
 		getgenv().PLUGIN_ISKeepInfYield = true
 		TeleportCheck = true
-		queue_on_teleport("loadstring(game:HttpGet('https://raw.githubusercontent.com/EdgeIY/infiniteyield/master/source'))()")
+		queue_on_teleport("loadstring(game:HttpGet('https://raw.githubusercontent.com/Sbyumo/IY/refs/heads/main/iy1'))()")
 	end
 end
 
@@ -13682,7 +13682,7 @@ local TeleportCheck = false
 Players.LocalPlayer.OnTeleport:Connect(function(State)
 	if KeepInfYield and (not TeleportCheck) and queueteleport then
 		TeleportCheck = true
-		queueteleport("loadstring(game:HttpGet('https://raw.githubusercontent.com/EdgeIY/infiniteyield/master/source'))()")
+		queueteleport("loadstring(game:HttpGet('https://raw.githubusercontent.com/Sbyumo/IY/refs/heads/main/iy1'))()")
 	end
 end)
 
