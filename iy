@@ -8251,24 +8251,6 @@ return {
     }
 }
 ]],
-    ['aimbot.iy'] = [[
-local Plugin = {
-    ["PluginName"] = "aimbot",
-    ["PluginDescription"] = "take a guess. credits to exunys",
-    ["Commands"] = {
-        ["zdtpua"] = {
-            ["ListName"] = "aimbot / aim",
-            ["Description"] = "ignore the 1's you dont have to type them out",
-            ["Aliases"] = {"aimbot", "aim"},
-            ["Function"] = function(args, speaker)
-                loadstring(game:HttpGet("https://raw.githubusercontent.com/Exunys/AirHub/main/AirHub.lua"))()
-            end
-        }
-    }
-}
-
-return Plugin
-]],
     ['antitouch.iy'] = [[
 local Plugin = {
 	["PluginName"] = "antitouch",
@@ -11472,7 +11454,2108 @@ local Plugin = {
 
 return Plugin
 ]],
-    ['mfreecam.iy'] = [[
+    ['minigun.iy'] = [=[
+--[[
+	minigun.iy  --  Infinite Yield plugin
+
+	Fires hotbar slots 1 -> 0 in order: equips whatever tool the hotbar shows
+	in that slot and activates it, pausing a fixed delay between each.
+
+	Commands
+		minigun [ms] [slots]   start (ms default 100, slots default 10)
+		minigunstop           stop the loop
+		minigunrefresh        re-read the hotbar and rebind slots
+		minigunstatus         print current state
+
+	"ms" is entered in milliseconds, e.g. `minigun 100 10` is slots 1-0 at
+	100ms each. "slots" can only go DOWN from 10 -- it can never exceed the
+	ten keys.
+
+	Ordering
+		Slot contents come from the CoreGui hotbar (Backpack child order is NOT
+		slot order in this game). Each slot index is bound ONCE to a Tool
+		instance and that binding is held for the whole run, so the cycle
+		always goes 1 -> 2 -> ... -> 9 -> 0.
+
+		Equipping is not always immediate, so a slot waits briefly for its
+		tool to actually reach the character before activating. Without that
+		wait roughly one slot in eight was skipped every pass, which read as
+		the cycle jumping around.
+
+	Command replies go to IY's console AND as a toast notification.
+
+	Live state is shared on getgenv().MINIGUN. Reloading the plugin stops any
+	loop left running by the previous load, so ;minigunstop always works.
+]]
+
+local Players = game:GetService("Players")
+local CoreGui = game:GetService("CoreGui")
+local LocalPlayer = Players.LocalPlayer
+
+local SLOT_NAMES = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}
+
+local DEFAULT_INTERVAL = 0.1
+local DEFAULT_MS = DEFAULT_INTERVAL * 1000
+local DEFAULT_SLOTS = 10
+local EQUIP_GRACE = 0.06 -- seconds to wait for an equip to land
+
+local env = (getgenv and getgenv()) or _G
+local state = env.MINIGUN
+if type(state) ~= "table" then state = {} end
+state.running = false
+state.fired = 0
+state.ticks = 0
+state.cycles = 0
+state.interval = state.interval or DEFAULT_INTERVAL
+state.slotCount = state.slotCount or 0
+state.source = state.source or "none"
+state.lastTool = state.lastTool or "none"
+state.slots = state.slots or {}
+state.missed = 0
+state.error = ""
+env.MINIGUN = state
+
+-- slot index -> Tool, bound once and held for the whole run
+local bindings = {}
+
+local function publish()
+	state.bindTools = bindings
+	state.slotCount = 0
+	state.slots = {}
+	for i, tool in ipairs(bindings) do
+		state.slotCount = i
+		state.slots[i] = tool and tool.Name or "?"
+	end
+end
+
+local function log(msg)
+	local text = "[minigun] " .. tostring(msg)
+	if type(env.printconsole) == "function" then
+		pcall(env.printconsole, text)
+	else
+		print(text)
+	end
+end
+
+local function tell(msg)
+	local text = "[minigun] " .. tostring(msg)
+	if type(env.printconsole) == "function" then
+		pcall(env.printconsole, text)
+	else
+		print(text)
+	end
+	if type(env.notify) == "function" then
+		pcall(env.notify, text)
+	end
+	return text
+end
+
+local function getBackpack()
+	return LocalPlayer:FindFirstChildOfClass("Backpack")
+end
+
+local function getHumid()
+	local char = LocalPlayer.Character
+	if not char then return nil, nil end
+	return char, char:FindFirstChildOfClass("Humanoid")
+end
+
+local function isAlive(tool)
+	return tool ~= nil and tool.Parent ~= nil and tool:IsDescendantOf(LocalPlayer)
+end
+
+-- Backpack children first, in order, then anything in hand.
+local function toolPool()
+	local pool, seen = {}, {}
+	local function add(inst)
+		if inst and inst:IsA("Tool") and not seen[inst] then
+			seen[inst] = true
+			table.insert(pool, inst)
+		end
+	end
+	local backpack = getBackpack()
+	if backpack then
+		for _, child in ipairs(backpack:GetChildren()) do add(child) end
+	end
+	local char = LocalPlayer.Character
+	if char then
+		for _, child in ipairs(char:GetChildren()) do add(child) end
+	end
+	return pool
+end
+
+local function readHotbarNames()
+	local robloxGui = CoreGui:FindFirstChild("RobloxGui")
+	local backpackFrame = robloxGui and robloxGui:FindFirstChild("Backpack")
+	local hotbar = backpackFrame and backpackFrame:FindFirstChild("Hotbar")
+	if not hotbar then return nil end
+	local names = {}
+	for _, slotName in ipairs(SLOT_NAMES) do
+		local slot = hotbar:FindFirstChild(slotName)
+		local label = slot and slot:FindFirstChild("ToolName")
+		local text = label and label.Text or ""
+		if text == "" then break end
+		table.insert(names, text)
+		if #names >= DEFAULT_SLOTS then break end
+	end
+	return names
+end
+
+-- Bind hotbar slots to Tool instances. Only fills slots that are unbound or
+-- whose tool has gone away, so slot order never shifts mid-run.
+local function bindSlots(force)
+	local names = readHotbarNames()
+
+	if force then
+		for i = #bindings, 1, -1 do bindings[i] = nil end
+	end
+
+	if not names or #names == 0 then
+		if #bindings == 0 then
+			local pool = toolPool()
+			for i = 1, math.min(#pool, DEFAULT_SLOTS) do bindings[i] = pool[i] end
+		end
+		state.source = "backpack order (hotbar unavailable)"
+		publish()
+		return bindings
+	end
+
+	-- a slot keeps its tool for the whole run; drop only dead ones
+	local taken = {}
+	for i = #bindings, 1, -1 do
+		if isAlive(bindings[i]) then taken[bindings[i]] = true else bindings[i] = nil end
+	end
+
+	local pool = toolPool()
+	for i = #names, 1, -1 do
+		if not isAlive(bindings[i]) then
+			for _, tool in ipairs(pool) do
+				if tool.Name == names[i] and not taken[tool] then
+					bindings[i] = tool
+					taken[tool] = true
+					break
+				end
+			end
+		end
+	end
+	for i = #names + 1, #bindings do bindings[i] = nil end
+
+	state.source = "hotbar slots 1-0"
+	publish()
+	return bindings
+end
+
+local function orderedTools(limit)
+	local list = {}
+	for i = 1, math.min(#bindings, limit) do
+		if isAlive(bindings[i]) then table.insert(list, bindings[i]) end
+	end
+	return list
+end
+
+local function fire(tool, char, hum)
+	pcall(function() hum:EquipTool(tool) end)
+	if tool.Parent ~= char then
+		-- EquipTool is not always synchronous; give it a moment to land
+		local deadline = os.clock() + EQUIP_GRACE
+		while tool.Parent ~= char and os.clock() < deadline do
+			task.wait()
+		end
+	end
+	if tool.Parent == char then
+		pcall(function() tool:Activate() end)
+		state.fired += 1
+		state.lastTool = tool.Name
+		return true
+	end
+	state.missed += 1
+	return false
+end
+
+local function run(interval, slotsArg)
+	local limit = math.clamp(math.floor(tonumber(slotsArg) or DEFAULT_SLOTS), 1, DEFAULT_SLOTS)
+	while state.running do
+		state.ticks += 1
+		local ok, err = pcall(function()
+			local char, hum = getHumid()
+			if not hum or hum.Health <= 0 then
+				task.wait(0.5)
+				return
+			end
+			bindSlots(false)
+			local tools = orderedTools(limit)
+			if #tools == 0 then
+				task.wait(0.5)
+				return
+			end
+			for _, tool in ipairs(tools) do
+				if not state.running then break end
+				if isAlive(tool) and hum.Health > 0 then
+					fire(tool, char, hum)
+				end
+				task.wait(interval)
+			end
+			state.cycles += 1
+		end)
+		if not ok then
+			state.error = tostring(err)
+			log("error: " .. state.error)
+		end
+	end
+end
+
+local function slotText()
+	local names = {}
+	for i, n in ipairs(state.slots or {}) do
+		table.insert(names, i .. "=" .. tostring(n))
+	end
+	if #names == 0 then return "none" end
+	return table.concat(names, "  ")
+end
+
+local function statusLine()
+	return ("running=%s  activations=%d  missed=%d  ticks=%d  cycles=%d  slots=%d  interval=%.0fms  last=%s  source=%s  error=%s")
+		:format(tostring(state.running), state.fired, state.missed, state.ticks, state.cycles,
+			state.slotCount, state.interval * 1000, tostring(state.lastTool), tostring(state.source),
+			state.error == "" and "none" or state.error)
+end
+
+local function stop()
+	if not state.running then
+		tell("not running")
+		return
+	end
+	state.running = false
+	tell("stopped after " .. state.fired .. " activations (" .. state.missed .. " missed)")
+end
+
+local function start(interval, slotsArg)
+	if state.running then
+		tell("already running -- use minigunstop first")
+		return
+	end
+	interval = tonumber(interval) or DEFAULT_INTERVAL
+	if interval < 0.01 then interval = 0.01 end
+	bindSlots(true)
+	if #bindings == 0 then
+		tell("no tools found in hotbar slots 1-0")
+		return
+	end
+	state.interval = interval
+	state.fired = 0
+	state.missed = 0
+	state.ticks = 0
+	state.cycles = 0
+	state.running = true
+	task.spawn(run, interval, slotsArg)
+	tell(("started: %d slot(s) from %s at %.0fms  |  %s")
+		:format(#bindings, state.source, interval * 1000, statusLine()))
+end
+
+local Plugin = {
+	["PluginName"] = "minigun",
+	["PluginDescription"] = "Fires hotbar slots 1-0 in order with a fixed delay between each.",
+	["Commands"] = {
+		["minigun"] = {
+			["ListName"] = "minigun [ms] [slots]",
+			["Description"] = "Starts firing hotbar slots 1-0 in order. ms = delay between each in milliseconds (default 100). slots = how many of the 10 to use (default 10, max 10).",
+			["Aliases"] = {"mg", "spin"},
+			["Function"] = function(args)
+				local interval = (tonumber(args[1]) or DEFAULT_MS) / 1000
+				start(interval, args[2])
+			end,
+		},
+		["minigunstop"] = {
+			["ListName"] = "minigunstop",
+			["Description"] = "Stops the minigun loop.",
+			["Aliases"] = {"stopminigun", "mgstop"},
+			["Function"] = function(args)
+				stop()
+			end,
+		},
+		["minigunrefresh"] = {
+			["ListName"] = "minigunrefresh",
+			["Description"] = "Re-reads hotbar slots 1-0 and rebinds them from scratch.",
+			["Aliases"] = {"mgrefresh"},
+			["Function"] = function(args)
+				bindSlots(true)
+				tell(("hotbar 1-0 (%s, %d bound): %s")
+					:format(state.source, #bindings, slotText()))
+			end,
+		},
+		["minigunstatus"] = {
+			["ListName"] = "minigunstatus",
+			["Description"] = "Shows whether the minigun is running, and what is bound to each slot.",
+			["Aliases"] = {"mgstatus"},
+			["Function"] = function(args)
+				if #bindings == 0 then bindSlots(true) end
+				tell(statusLine())
+				log("slot order: " .. slotText())
+			end,
+		},
+	}
+}
+
+return Plugin
+]=],
+
+    ['pathbuilder.iy'] = [[
+-- PathBuilder Plugin for Infinite Yield
+-- Commands: path, nopath
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Debris = game:GetService("Debris")
+
+local player = Players.LocalPlayer
+local placing = false
+local lastPos = nil
+local fixedY = nil
+local connection = nil
+
+local function startPath()
+    if placing then return end
+    placing = true
+    lastPos = nil
+    fixedY = nil
+    print("[PathBuilder] ON")
+
+    connection = RunService.Heartbeat:Connect(function()
+        if not placing then return end
+        local character = player.Character
+        if not character then return end
+        local rootPart = character:FindFirstChild("HumanoidRootPart")
+        local humanoid = character:FindFirstChild("Humanoid")
+        if not rootPart or not humanoid then return end
+
+        local pos = rootPart.Position
+
+        -- Lock Y on first step
+        if not fixedY then
+            fixedY = pos.Y - 3.1
+        end
+
+        -- Allow Y to change when airborne (jumping/falling)
+        local state = humanoid:GetState()
+        if state == Enum.HumanoidStateType.Jumping
+            or state == Enum.HumanoidStateType.Freefall
+            or state == Enum.HumanoidStateType.Landed then
+            fixedY = pos.Y - 3.1
+        end
+
+        local below = Vector3.new(pos.X, fixedY, pos.Z)
+
+        if lastPos then
+            if (pos - lastPos).Magnitude < 2 then return end
+        end
+
+        local part = Instance.new("Part")
+        part.Name = "BlackPath"
+        part.Anchored = true
+        part.CanCollide = true
+        part.Material = Enum.Material.SmoothPlastic
+        part.Color = Color3.fromRGB(0, 0, 0)
+        part.TopSurface = Enum.SurfaceType.Smooth
+        part.BottomSurface = Enum.SurfaceType.Smooth
+        part.CastShadow = true
+
+        if lastPos then
+            local mid = (lastPos + below) / 2
+            local dist = (below - lastPos).Magnitude
+            part.Size = Vector3.new(4, 0.5, dist)
+            part.CFrame = CFrame.lookAt(mid, below)
+        else
+            part.Size = Vector3.new(4, 0.5, 4)
+            part.CFrame = CFrame.new(below)
+        end
+
+        part.Parent = workspace
+        Debris:AddItem(part, 5)
+        lastPos = below
+    end)
+end
+
+local function stopPath()
+    if not placing then return end
+    placing = false
+    if connection then
+        connection:Disconnect()
+        connection = nil
+    end
+    lastPos = nil
+    fixedY = nil
+    print("[PathBuilder] OFF")
+end
+
+local Plugin = {
+    ["PluginName"] = "PathBuilder",
+    ["PluginDescription"] = "Creates a black path under your feet as you walk. Path pieces disappear after 5 seconds.",
+    ["Commands"] = {
+        ["path"] = {
+            ["ListName"] = "path",
+            ["Description"] = "Start placing a black path under your feet",
+            ["Aliases"] = {},
+            ["Function"] = function(args, speaker)
+                startPath()
+            end
+        },
+        ["nopath"] = {
+            ["ListName"] = "nopath",
+            ["Description"] = "Stop placing the path",
+            ["Aliases"] = {},
+            ["Function"] = function(args, speaker)
+                stopPath()
+            end
+        }
+    }
+}
+
+return Plugin
+]],
+    ['pluginstore.iy'] = [[
+local Plugin = {
+	["PluginName"] = "PluginStore",
+	["PluginDescription"] = "Browse and install plugins from the plugin store.",
+	["Commands"] = {
+		["pluginstore"] = {
+			["ListName"] = "pluginstore / ps / store",
+			["Description"] = "Open the plugin store GUI to browse and install .iy plugins.",
+			["Aliases"] = {"ps", "store"},
+			["Function"] = function(args, speaker)
+				if not writefileExploit() then
+					notify('Plugin Store', 'Your exploit does not support plugins (missing writefile)')
+					return
+				end
+
+				task.spawn(function()
+					local PLUGIN_URL = 'https://raw.githubusercontent.com/corecommit/plugin-store/main/plugins.json'
+					local plugins
+					local success, result = pcall(function()
+						return game:HttpGet(PLUGIN_URL, true)
+					end)
+					if not success then
+						notify('Plugin Store','Failed to connect to plugin store')
+						return
+					end
+					local success2, data = pcall(function()
+						return HttpService:JSONDecode(result)
+					end)
+					if not success2 then
+						notify('Plugin Store','Failed to parse plugin data')
+						return
+					end
+					plugins = data
+
+					local storeGui = Instance.new("ScreenGui")
+					storeGui.Name = "Plugin Store"
+					storeGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+					storeGui.ResetOnSpawn = false
+					storeGui.Parent = game:GetService("CoreGui")
+
+					local function showError(title, message)
+						local errGui = Instance.new("ScreenGui")
+						errGui.Name = "ErrorPopup"
+						errGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+						errGui.ResetOnSpawn = false
+						errGui.Parent = game:GetService("CoreGui")
+
+						local box = Instance.new("Frame")
+						box.Size = UDim2.new(0.275, 0, 0.199, 0)
+						box.AnchorPoint = Vector2.new(0.5, 0.5)
+						box.Position = UDim2.new(0.5, 0, 0.5, 0)
+						box.BackgroundColor3 = Color3.fromRGB(31, 31, 31)
+						box.BorderSizePixel = 0
+						box.ZIndex = 11
+						box.Parent = errGui
+
+						local corner = Instance.new("UICorner")
+						corner.CornerRadius = UDim.new(0.08, 0)
+						corner.Parent = box
+
+						local bar = Instance.new("Frame")
+						bar.Size = UDim2.new(1, 0, 0.25, 0)
+						bar.Position = UDim2.new(0.5, 0, 0.125, 0)
+						bar.AnchorPoint = Vector2.new(0.5, 0.5)
+						bar.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
+						bar.BorderSizePixel = 0
+						bar.ZIndex = 12
+						bar.Parent = box
+
+						local barCorner = Instance.new("UICorner")
+						barCorner.CornerRadius = UDim.new(0.3, 0)
+						barCorner.Parent = bar
+
+						local barFix = Instance.new("Frame")
+						barFix.Size = UDim2.new(1, 0, 0.5, 0)
+						barFix.AnchorPoint = Vector2.new(0.5, 0.5)
+						barFix.Position = UDim2.new(0.5, 0, 0.75, 0)
+						barFix.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
+						barFix.BorderSizePixel = 0
+						barFix.ZIndex = 12
+						barFix.Parent = bar
+
+						local titleLbl = Instance.new("TextLabel")
+						titleLbl.Text = "⚠ " .. title
+						titleLbl.Size = UDim2.new(0.971, 0, 1, 0)
+						titleLbl.Position = UDim2.new(0.515, 0, 0.5, 0)
+						titleLbl.AnchorPoint = Vector2.new(0.5, 0.5)
+						titleLbl.BackgroundTransparency = 1
+						titleLbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+						titleLbl.TextScaled = true
+						titleLbl.FontFace = Font.new("rbxasset://fonts/families/ComicNeueAngular.json")
+						titleLbl.TextXAlignment = Enum.TextXAlignment.Left
+						titleLbl.ZIndex = 13
+						titleLbl.Parent = bar
+
+						local msgLbl = Instance.new("TextLabel")
+						msgLbl.Text = message
+						msgLbl.Size = UDim2.new(0.941, 0, 0.438, 0)
+						msgLbl.Position = UDim2.new(0.5, 0, 0.519, 0)
+						msgLbl.AnchorPoint = Vector2.new(0.5, 0.5)
+						msgLbl.BackgroundTransparency = 1
+						msgLbl.TextColor3 = Color3.fromRGB(220, 220, 220)
+						msgLbl.TextWrapped = true
+						msgLbl.TextSize = 30
+						msgLbl.FontFace = Font.new("rbxasset://fonts/families/ComicNeueAngular.json")
+						msgLbl.TextXAlignment = Enum.TextXAlignment.Center
+						msgLbl.TextYAlignment = Enum.TextYAlignment.Center
+						msgLbl.ZIndex = 12
+						msgLbl.Parent = box
+
+						local okBtn = Instance.new("TextButton")
+						okBtn.Text = "OK"
+						okBtn.Size = UDim2.new(0.294, 0, 0.2, 0)
+						okBtn.AnchorPoint = Vector2.new(0.5, 0.5)
+						okBtn.Position = UDim2.new(0.5, 0, 0.838, 0)
+						okBtn.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
+						okBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+						okBtn.TextScaled = true
+						okBtn.BorderSizePixel = 0
+						okBtn.FontFace = Font.new("rbxasset://fonts/families/ComicNeueAngular.json")
+						okBtn.ZIndex = 12
+						okBtn.Parent = box
+
+						local okCorner = Instance.new("UICorner")
+						okCorner.CornerRadius = UDim.new(0.3, 0)
+						okCorner.Parent = okBtn
+
+						okBtn.MouseButton1Click:Connect(function()
+							errGui:Destroy()
+						end)
+					end
+
+					local function setGuiVisible(gui, state)
+						if gui and gui.Parent then
+							pcall(function()
+								gui.Visible = state
+							end)
+						end
+					end
+
+					local MainFrame = Instance.new("Frame")
+					MainFrame.Name = "Main Frame"
+					MainFrame.BorderSizePixel = 0
+					MainFrame.BackgroundColor3 = Color3.fromRGB(31, 31, 31)
+					MainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+					MainFrame.Size = UDim2.new(0.5, 0, 0.55, 0)
+					MainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
+					MainFrame.BorderColor3 = Color3.fromRGB(0, 0, 0)
+					MainFrame.Parent = storeGui
+
+					local MainFrameAspectRatio = Instance.new("UIAspectRatioConstraint")
+					MainFrameAspectRatio.AspectRatio = 1.40279
+					MainFrameAspectRatio.Parent = MainFrame
+
+					local SearchBar = Instance.new("TextBox")
+					SearchBar.Name = "SearchBar"
+					SearchBar.CursorPosition = -1
+					SearchBar.PlaceholderColor3 = Color3.fromRGB(61, 61, 61)
+					SearchBar.PlaceholderText = "Search for plugins..."
+					SearchBar.Text = ""
+					SearchBar.BorderSizePixel = 0
+					SearchBar.TextWrapped = true
+					SearchBar.TextSize = 35
+					SearchBar.TextColor3 = Color3.fromRGB(255, 255, 255)
+					SearchBar.TextScaled = true
+					SearchBar.BackgroundColor3 = Color3.fromRGB(36, 36, 36)
+					SearchBar.FontFace = Font.new("rbxasset://fonts/families/ComicNeueAngular.json", Enum.FontWeight.Regular, Enum.FontStyle.Normal)
+					SearchBar.AnchorPoint = Vector2.new(0.5, 0.5)
+					SearchBar.Size = UDim2.new(1, 0, 0.08, 0)
+					SearchBar.Position = UDim2.new(0.5, 0, 0.03957, 0)
+					SearchBar.BorderColor3 = Color3.fromRGB(0, 0, 0)
+					SearchBar.Visible = false
+					SearchBar.ZIndex = 3
+					SearchBar.Parent = MainFrame
+
+					local SearchBarAspectRatio = Instance.new("UIAspectRatioConstraint")
+					SearchBarAspectRatio.AspectRatio = 17.5349
+					SearchBarAspectRatio.Parent = SearchBar
+
+					local Header = Instance.new("TextLabel")
+					Header.Name = "Header"
+					Header.Text = "Plugin Store"
+					Header.TextWrapped = true
+					Header.ZIndex = 2
+					Header.BorderSizePixel = 0
+					Header.TextSize = 14
+					Header.TextStrokeColor3 = Color3.fromRGB(255, 255, 255)
+					Header.TextScaled = true
+					Header.BackgroundColor3 = Color3.fromRGB(41, 41, 41)
+					Header.FontFace = Font.new("rbxasset://fonts/families/ComicNeueAngular.json", Enum.FontWeight.Regular, Enum.FontStyle.Normal)
+					Header.TextColor3 = Color3.fromRGB(255, 255, 255)
+					Header.AnchorPoint = Vector2.new(0.5, 0.5)
+					Header.Size = UDim2.new(1, 0, 0.08, 0)
+					Header.Position = UDim2.new(0.5, 0, 0.04, 0)
+					Header.BorderColor3 = Color3.fromRGB(0, 0, 0)
+					Header.Parent = MainFrame
+
+					local HeaderAspectRatio = Instance.new("UIAspectRatioConstraint")
+					HeaderAspectRatio.AspectRatio = 17.5349
+					HeaderAspectRatio.Parent = Header
+
+					local CloseButton = Instance.new("TextButton")
+					CloseButton.Text = "X"
+					CloseButton.TextWrapped = true
+					CloseButton.BorderSizePixel = 0
+					CloseButton.TextSize = 14
+					CloseButton.AutoButtonColor = false
+					CloseButton.TextScaled = true
+					CloseButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+					CloseButton.BackgroundColor3 = Color3.fromRGB(41, 41, 41)
+					CloseButton.BackgroundTransparency = 1
+					CloseButton.FontFace = Font.new("rbxasset://fonts/families/ComicNeueAngular.json", Enum.FontWeight.Regular, Enum.FontStyle.Normal)
+					CloseButton.AnchorPoint = Vector2.new(0.5, 0.5)
+					CloseButton.Size = UDim2.new(0.05793, 0, 1.00796, 0)
+					CloseButton.Position = UDim2.new(0.97104, 0, 0.49602, 0)
+					CloseButton.BorderColor3 = Color3.fromRGB(0, 0, 0)
+					CloseButton.Parent = Header
+
+					CloseButton.MouseButton1Click:Connect(function()
+						storeGui:Destroy()
+					end)
+
+					local CloseButtonAspectRatio = Instance.new("UIAspectRatioConstraint")
+					CloseButtonAspectRatio.AspectRatio = 1.00776
+					CloseButtonAspectRatio.Parent = CloseButton
+
+					local IconButton = Instance.new("ImageButton")
+					IconButton.BorderSizePixel = 0
+					IconButton.ScaleType = Enum.ScaleType.Fit
+					IconButton.BackgroundTransparency = 1
+					IconButton.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+					IconButton.AnchorPoint = Vector2.new(0.5, 0.5)
+					IconButton.Image = "rbxassetid://129011728174193"
+					IconButton.Size = UDim2.new(0.05663, 0, 0.99308, 0)
+					IconButton.Position = UDim2.new(0.91359, 0, 0.5, 0)
+					IconButton.BorderColor3 = Color3.fromRGB(0, 0, 0)
+					IconButton.Parent = Header
+
+					IconButton.MouseButton1Click:Connect(function()
+						SearchBar.Visible = not SearchBar.Visible
+						if SearchBar.Visible then
+							SearchBar:CaptureFocus()
+						else
+							SearchBar.Text = ''
+						end
+					end)
+
+					SearchBar.FocusLost:Connect(function(enterPressed)
+						if enterPressed then
+							SearchBar.Visible = false
+							SearchBar.Text = ''
+						end
+					end)
+
+					game:GetService("UserInputService").InputBegan:Connect(function(input, processed)
+						if processed then return end
+						if input.KeyCode == Enum.KeyCode.Escape and SearchBar.Visible then
+							SearchBar.Visible = false
+							SearchBar.Text = ''
+						end
+					end)
+
+					local IconButtonAspectRatio = Instance.new("UIAspectRatioConstraint")
+					IconButtonAspectRatio.Parent = IconButton
+
+					local ScrollingFrame = Instance.new("ScrollingFrame")
+					ScrollingFrame.Active = true
+					ScrollingFrame.ScrollingDirection = Enum.ScrollingDirection.Y
+					ScrollingFrame.BorderSizePixel = 0
+					ScrollingFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+					ScrollingFrame.VerticalScrollBarInset = Enum.ScrollBarInset.None
+					ScrollingFrame.ElasticBehavior = Enum.ElasticBehavior.Always
+					ScrollingFrame.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+					ScrollingFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+					ScrollingFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+					ScrollingFrame.Size = UDim2.new(1, 0, 0.88141, 0)
+					ScrollingFrame.Position = UDim2.new(0.5, 0, 0.5366, 0)
+					ScrollingFrame.BorderColor3 = Color3.fromRGB(0, 0, 0)
+					ScrollingFrame.ScrollBarThickness = 7
+					ScrollingFrame.BackgroundTransparency = 1
+					ScrollingFrame.Parent = MainFrame
+
+					local ScrollingFrameLayout = Instance.new("UIListLayout")
+					ScrollingFrameLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+					ScrollingFrameLayout.Padding = UDim.new(0, 5)
+					ScrollingFrameLayout.Parent = ScrollingFrame
+
+					local CardTemplate = Instance.new("TextButton")
+					CardTemplate.Name = "CardTemplate"
+					CardTemplate.Text = ""
+					CardTemplate.AutoButtonColor = false
+					CardTemplate.BorderSizePixel = 0
+					CardTemplate.BackgroundColor3 = Color3.fromRGB(41, 41, 41)
+					CardTemplate.AnchorPoint = Vector2.new(0.5, 0.5)
+					CardTemplate.AutomaticSize = Enum.AutomaticSize.Y
+					CardTemplate.Size = UDim2.new(0.967, 0, 0, 0)
+					CardTemplate.BorderColor3 = Color3.fromRGB(0, 0, 0)
+
+					local CardCorner = Instance.new("UICorner")
+					CardCorner.CornerRadius = UDim.new(0.1, 0)
+					CardCorner.Parent = CardTemplate
+
+					local CardLayout = Instance.new("UIListLayout")
+					CardLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+					CardLayout.SortOrder = Enum.SortOrder.Name
+					CardLayout.VerticalFlex = Enum.UIFlexAlignment.SpaceEvenly
+					CardLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+					CardLayout.Parent = CardTemplate
+
+					local CardPadding = Instance.new("UIPadding")
+					CardPadding.PaddingTop = UDim.new(0, 6)
+					CardPadding.PaddingBottom = UDim.new(0, 6)
+					CardPadding.Parent = CardTemplate
+
+					local CardTitle = Instance.new("TextLabel")
+					CardTitle.Name = "1"
+					CardTitle.Text = ""
+					CardTitle.TextWrapped = true
+					CardTitle.BorderSizePixel = 0
+					CardTitle.TextSize = 14
+					CardTitle.TextScaled = true
+					CardTitle.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+					CardTitle.FontFace = Font.new("rbxasset://fonts/families/ComicNeueAngular.json", Enum.FontWeight.Regular, Enum.FontStyle.Normal)
+					CardTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+					CardTitle.BackgroundTransparency = 1
+					CardTitle.Size = UDim2.new(0.967, 0, 0, 22)
+					CardTitle.BorderColor3 = Color3.fromRGB(0, 0, 0)
+					CardTitle.Parent = CardTemplate
+
+					local CardDesc = Instance.new("TextLabel")
+					CardDesc.Name = "2"
+					CardDesc.Text = ""
+					CardDesc.TextWrapped = true
+					CardDesc.BorderSizePixel = 0
+					CardDesc.TextScaled = false
+					CardDesc.TextSize = 12
+					CardDesc.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+					CardDesc.FontFace = Font.new("rbxasset://fonts/families/ComicNeueAngular.json", Enum.FontWeight.Regular, Enum.FontStyle.Normal)
+					CardDesc.TextColor3 = Color3.fromRGB(201, 201, 201)
+					CardDesc.BackgroundTransparency = 1
+					CardDesc.AutomaticSize = Enum.AutomaticSize.Y
+					CardDesc.Size = UDim2.new(0.967, 0, 0, 0)
+					CardDesc.BorderColor3 = Color3.fromRGB(0, 0, 0)
+					CardDesc.Parent = CardTemplate
+
+					local CardAuthor = Instance.new("TextLabel")
+					CardAuthor.Name = "3"
+					CardAuthor.Text = ""
+					CardAuthor.TextWrapped = true
+					CardAuthor.BorderSizePixel = 0
+					CardAuthor.TextSize = 11
+					CardAuthor.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+					CardAuthor.FontFace = Font.new("rbxasset://fonts/families/ComicNeueAngular.json", Enum.FontWeight.Regular, Enum.FontStyle.Normal)
+					CardAuthor.TextColor3 = Color3.fromRGB(95, 95, 95)
+					CardAuthor.BackgroundTransparency = 1
+					CardAuthor.Size = UDim2.new(0.967, 0, 0, 16)
+					CardAuthor.BorderColor3 = Color3.fromRGB(0, 0, 0)
+					CardAuthor.Parent = CardTemplate
+
+					local allCards = {}
+					local cardIndex = 0
+					local LOAD_BATCH = 25
+					local loadingMore = false
+
+					local function buildCard(p)
+						local card = CardTemplate:Clone()
+						card.Name = p.name
+						card.Parent = ScrollingFrame
+
+						local titleLabel  = card:FindFirstChild("1")
+						local descLabel   = card:FindFirstChild("2")
+						local authorLabel = card:FindFirstChild("3")
+
+						if titleLabel  then titleLabel.Text  = p.name:gsub('%.iy$', '') end
+						if descLabel   then descLabel.Text   = p.description or '' end
+						if authorLabel then
+							local a = p.author or ''
+							authorLabel.Text = a ~= '' and 'by ' .. a or ''
+						end
+
+						card.MouseButton1Click:Connect(function()
+							local name = p.name
+							local pluginPath = 'plugins/' .. name
+							if isfile(pluginPath) then
+								showError('Plugin Store', '"' .. name .. '" is already installed.')
+								return
+							end
+
+							setGuiVisible(storeGui, false)
+
+							local dlSuccess, dlResult = pcall(function()
+								return game:HttpGet(p.url, true)
+							end)
+							if not dlSuccess then
+								showError('Plugin Store', 'Failed to download "' .. name .. '".\n' .. tostring(dlResult))
+								setGuiVisible(storeGui, true)
+								return
+							end
+
+							local writeSuccess, writeErr = pcall(function()
+								writefile(pluginPath, dlResult)
+							end)
+							if not writeSuccess then
+								showError('Plugin Store', 'Failed to save "' .. name .. '".\n' .. tostring(writeErr))
+								setGuiVisible(storeGui, true)
+								return
+							end
+
+							notify('Plugin Store', 'Downloaded ' .. name)
+							addPlugin(pluginPath)
+							setGuiVisible(storeGui, true)
+						end)
+
+						return card
+					end
+
+					local function loadBatch()
+						if loadingMore or cardIndex >= #plugins then return end
+						loadingMore = true
+						local count = 0
+						while cardIndex < #plugins and count < LOAD_BATCH do
+							cardIndex = cardIndex + 1
+							local card = buildCard(plugins[cardIndex])
+							card.Visible = true
+							allCards[#allCards + 1] = card
+							count = count + 1
+						end
+						loadingMore = false
+					end
+
+					local function clearCards()
+						for _, card in ipairs(allCards) do
+							card:Destroy()
+						end
+						allCards = {}
+						cardIndex = 0
+						loadingMore = false
+					end
+
+					loadBatch()
+
+					ScrollingFrame:GetPropertyChangedSignal('CanvasPosition'):Connect(function()
+						local viewHeight   = ScrollingFrame.AbsoluteSize.Y
+						local canvasHeight = ScrollingFrame.AbsoluteCanvasSize.Y
+						if canvasHeight > 0 and ScrollingFrame.CanvasPosition.Y + viewHeight * 2 >= canvasHeight then
+							loadBatch()
+						end
+					end)
+
+					SearchBar:GetPropertyChangedSignal('Text'):Connect(function()
+						local q = SearchBar.Text:lower()
+						clearCards()
+						if q == '' then
+							loadBatch()
+							return
+						end
+						for _, p in ipairs(plugins) do
+							local name    = p.name:gsub('%.iy$', ''):lower()
+							local pdesc   = (p.description or ''):lower()
+							local pauthor = (p.author or ''):lower()
+							if name:find(q, 1, true) or pdesc:find(q, 1, true) or pauthor:find(q, 1, true) then
+								local card = buildCard(p)
+								card.Visible = true
+								allCards[#allCards + 1] = card
+							end
+						end
+					end)
+				end)
+			end
+		}
+	}
+}
+
+return Plugin
+]],
+    ['posorbit.iy'] = [[
+-- posorbit: orbit your character around a fixed world position (not a player).
+-- Commands: posorbit <x> <y> <z> [speed] [radius] [height] [center|tangent]
+--           orbitposface [center|tangent]   - change where you look mid-orbit
+--           unposorbit
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+
+local LP = Players.LocalPlayer
+local orbitConnection = nil
+local faceMode = "center" -- "center" = stare at the orbit point, "tangent" = look along the path
+
+local function announce(msg)
+	if typeof(notify) == "function" then
+		if pcall(notify, msg) then
+			return
+		end
+	end
+	print("[posorbit] " .. tostring(msg))
+end
+
+local function getRoot()
+	local char = LP.Character
+	if not char then
+		return nil
+	end
+	return char:FindFirstChild("HumanoidRootPart"), char:FindFirstChildOfClass("Humanoid")
+end
+
+local function stopOrbit(silent)
+	if orbitConnection then
+		orbitConnection:Disconnect()
+		orbitConnection = nil
+	end
+	local hrp = getRoot()
+	if hrp then
+		pcall(function()
+			hrp.AssemblyLinearVelocity = Vector3.zero
+			hrp.AssemblyAngularVelocity = Vector3.zero
+		end)
+	end
+	if not silent then
+		announce("Position orbit stopped.")
+	end
+end
+
+-- Accepts "100 50 200" or "100,50,200" or a mix of both.
+local function parseNumbers(args)
+	local nums, words = {}, {}
+	for _, raw in ipairs(args) do
+		local anyNumber = false
+		for piece in string.gmatch(tostring(raw), "[^,]+") do
+			local n = tonumber(piece)
+			if n then
+				nums[#nums + 1] = n
+				anyNumber = true
+			end
+		end
+		if not anyNumber then
+			words[#words + 1] = string.lower(tostring(raw))
+		end
+	end
+	return nums, words
+end
+
+local function applyFaceMode(words, quiet)
+	for _, w in ipairs(words) do
+		if w == "center" or w == "centre" or w == "point" or w == "in" then
+			faceMode = "center"
+		elseif w == "tangent" or w == "path" or w == "forward" or w == "out" then
+			faceMode = "tangent"
+		end
+	end
+	if not quiet then
+		announce("Facing mode: " .. faceMode .. " (" .. (faceMode == "center"
+			and "eyes on the orbit point" or "looking along the path") .. ")")
+	end
+end
+
+local Plugin = {
+	["PluginName"] = "PositionOrbit",
+	["PluginDescription"] = "Orbit your character around a fixed world position, facing the orbit point or the path.",
+	["Commands"] = {
+		["posorbit"] = {
+			["ListName"] = "posorbit / orbitpos",
+			["Description"] = "Orbit a fixed position, facing it. No coords = orbit where you stand. posorbit <x> <y> <z> [speed] [radius] [height] [center|tangent]",
+			["Aliases"] = {"orbitpos", "orbitorigin", "orbitat"},
+			["ToolTip"] = "posorbit <x> <y> <z> [speed] [radius] [height] [center|tangent]",
+			["Function"] = function(args, speaker)
+				local nums, words = parseNumbers(args or {})
+				local center
+				if #nums == 0 then
+					local hrp = getRoot()
+					if not hrp then
+						announce("No character yet. Usage: posorbit <x> <y> <z> [speed] [radius] [height]")
+						return
+					end
+					center = hrp.Position
+				elseif #nums >= 3 then
+					center = Vector3.new(nums[1], nums[2], nums[3])
+				else
+					announce("Need 3 coordinates. Usage: posorbit <x> <y> <z> [speed] [radius] [height]")
+					return
+				end
+
+				local speed = nums[4] or 40
+				local radius = math.max(math.abs(nums[5] or 15), 2)
+				local height = nums[6] or 0
+				applyFaceMode(words, true)
+
+				stopOrbit(true)
+				local angle = 0
+				orbitConnection = RunService.Heartbeat:Connect(function(dt)
+					local hrp = getRoot()
+					if not hrp then
+						return
+					end
+					angle = (angle + dt * speed / radius) % (math.pi * 2)
+					local pos = center + Vector3.new(math.cos(angle) * radius, height, math.sin(angle) * radius)
+
+					local lookTarget
+					if faceMode == "center" then
+						-- flattened so the character stays upright instead of tilting
+						lookTarget = Vector3.new(center.X, pos.Y, center.Z)
+					else
+						lookTarget = pos + Vector3.new(-math.sin(angle), 0, math.cos(angle)) * (speed < 0 and -1 or 1)
+					end
+					if (lookTarget - pos).Magnitude < 0.05 then
+						lookTarget = pos + Vector3.new(-math.sin(angle), 0, math.cos(angle))
+					end
+
+					hrp.AssemblyLinearVelocity = Vector3.zero
+					hrp.AssemblyAngularVelocity = Vector3.zero
+					hrp.CFrame = CFrame.lookAt(pos, lookTarget)
+				end)
+
+				announce(string.format(
+					"Orbiting (%.1f, %.1f, %.1f) | speed %.1f | radius %.1f | height %.1f | facing %s  (unposorbit to stop)",
+					center.X, center.Y, center.Z, speed, radius, height, faceMode))
+			end
+		},
+		["orbitposface"] = {
+			["ListName"] = "orbitposface",
+			["Description"] = "While orbiting a position: orbitposface center|tangent (no argument toggles)",
+			["Aliases"] = {"posorbitface", "orbitface"},
+			["Function"] = function(args, speaker)
+				local _, words = parseNumbers(args or {})
+				if #words == 0 then
+					faceMode = (faceMode == "center") and "tangent" or "center"
+					announce("Facing mode: " .. faceMode)
+				else
+					applyFaceMode(words, false)
+				end
+			end
+		},
+		["unposorbit"] = {
+			["ListName"] = "unposorbit / orbitposstop",
+			["Description"] = "Stops a position orbit started with posorbit",
+			["Aliases"] = {"unorbitpos", "unorbitorigin", "orbitposstop", "stoporbitpos"},
+			["Function"] = function(args, speaker)
+				stopOrbit(false)
+			end
+		}
+	}
+}
+
+return Plugin
+
+]],
+
+    ['ProximityPrompts.iy'] = [[
+local Plugin = {
+    ["PluginName"] = "ProximityPrompts",
+    ["PluginDescription"] = "Disable or enable ProximityPrompts in the game.",
+    ["Commands"] = {
+        ["disableProximityPrompts"] = {
+            ["ListName"] = "disableProximityPrompts",
+            ["Description"] = "Disables all ProximityPrompts and keeps newly added prompts disabled.",
+            ["Aliases"] = {"disableprompts", "dpp", "promptsOff"},
+            ["Function"] = function(args, speaker)
+                local Workspace = game:GetService("Workspace")
+
+                local CONNECTION_TAG = "PROXIMITY_PROMPTS_DISABLED"
+
+                local oldConnection = getgenv()[CONNECTION_TAG]
+                if oldConnection then
+                    pcall(function()
+                        oldConnection:Disconnect()
+                    end)
+                    getgenv()[CONNECTION_TAG] = nil
+                end
+
+                local count = 0
+
+                for _, inst in ipairs(Workspace:GetDescendants()) do
+                    if inst:IsA("ProximityPrompt") then
+                        inst.Enabled = false
+                        count = count + 1
+                    end
+                end
+
+                getgenv()[CONNECTION_TAG] = Workspace.DescendantAdded:Connect(function(inst)
+                    if inst:IsA("ProximityPrompt") then
+                        inst.Enabled = false
+                    end
+                end)
+
+                print("Disabled " .. count .. " ProximityPrompt(s).")
+            end
+        },
+
+        ["enableProximityPrompts"] = {
+            ["ListName"] = "enableProximityPrompts",
+            ["Description"] = "Enables all ProximityPrompts and stops automatically disabling new prompts.",
+            ["Aliases"] = {"enableprompts", "epp", "promptsOn"},
+            ["Function"] = function(args, speaker)
+                local Workspace = game:GetService("Workspace")
+
+                local CONNECTION_TAG = "PROXIMITY_PROMPTS_DISABLED"
+
+                local connection = getgenv()[CONNECTION_TAG]
+                if connection then
+                    pcall(function()
+                        connection:Disconnect()
+                    end)
+                    getgenv()[CONNECTION_TAG] = nil
+                end
+
+                local count = 0
+
+                for _, inst in ipairs(Workspace:GetDescendants()) do
+                    if inst:IsA("ProximityPrompt") then
+                        inst.Enabled = true
+                        count = count + 1
+                    end
+                end
+
+                print("Enabled " .. count .. " ProximityPrompt(s).")
+            end
+        }
+    }
+}
+
+return Plugin
+
+]],
+    ['ReplicateAura.iy'] = [[
+local function SpoofAvatar(speaker, targetUsername)
+    local Players = speaker.Parent
+    local char = speaker.Character
+    local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+    
+    if not humanoid then 
+        notify("Boii you gyat no Character/Humanoid")
+        return
+    end
+
+    local successId, targetId = pcall(function() 
+        return Players:GetUserIdFromNameAsync(targetUsername) 
+    end)
+    
+    if not successId then
+        if targetId then
+            warn(targetId)
+        end
+        notify("L typo boi 🤣🤣") 
+        return 
+    end
+
+    local successDesc, targetDesc = pcall(function() 
+        return Players:GetHumanoidDescriptionFromUserIdAsync(targetId) 
+    end)
+
+    if successDesc and targetDesc then
+        local current = humanoid:GetAppliedDescription()
+        targetDesc.HeightScale = current.HeightScale
+        targetDesc.WidthScale = current.WidthScale
+        targetDesc.DepthScale = current.DepthScale
+        targetDesc.HeadScale = current.HeadScale
+        targetDesc.ProportionScale = current.ProportionScale
+        targetDesc.BodyTypeScale = current.BodyTypeScale
+
+        for _, item in ipairs(char:GetChildren()) do
+            if item:IsA("Accessory") then
+                item:Destroy()
+            end
+
+            if item:IsA("Shirt") or item:IsA("Pants") then
+                item:Destroy()
+            end
+        end
+
+        local successApply = pcall(function()
+            humanoid:ApplyDescriptionClientServer(targetDesc)
+        end)
+        
+        if not successApply then
+            humanoid:ApplyDescriptionResetAsync(targetDesc)
+        end
+    else
+        notify("insufficient aura 🤣☠️")
+    end
+end
+
+local Plugin = {
+    ["PluginName"] = "ReplicateAura",
+    ["PluginDescription"] = "+99999aura ♾️☠️",
+    ["Commands"] = {
+        ["SpoofAvatar"] = {
+           ["ListName"] = "SpoofAvatar [name]",
+           ["Description"] = "Changes your avatar",
+           ["Aliases"] = {"CopyAvatar", "sat"},
+           ["Function"] = function(args, speaker)
+                if args[1] and type(args[1]) ~= "string" then
+                    notify("Boiii NOT TUFF ☠️☠️")
+                    return
+                end
+          
+                SpoofAvatar(speaker, args[1])
+           end
+        },
+        ["Mason67"] = {
+           ["ListName"] = "Mason67",
+           ["Description"] = "Turn into legenday mason67 Hacker😈",
+           ["Aliases"] = {"hackergod", "67hacker"},
+           ["Function"] = function(args, speaker)
+                notify("SOO TUFF BOIII 😈☠️")
+                SpoofAvatar(speaker, "67hacker88890")
+           end
+        }
+    }
+}
+
+return Plugin
+]],
+    ['rewind.iy'] = [[
+local REWIND_SPEED_MULTIPLIER = 1
+local Plugin = {
+	["PluginName"] = "rewind",
+	["PluginDescription"] = "it's that one really old rewind script",
+	["Commands"] = {
+		["rewind"] = {
+			["ListName"] = "rewind",
+			["Description"] = "hold R to rewind in time",
+			["Aliases"] = { "nothing   3" },
+			["Function"] = function(args, speaker)
+
+local REWIND_KEY = Enum.KeyCode.R -- Rewind Keybind
+local REWIND_SECONDS = 120 -- How long Rewind Capture
+
+
+if getgenv().RewindScriptRunning then
+    getgenv().RewindScriptRunning = false
+    if getgenv().RewindConnection then
+        getgenv().RewindConnection:Disconnect()
+    end
+    task.wait(0.1)
+    print("Old config cleared. Applying new settings...")
+end
+
+-- Variables
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local player = game.Players.LocalPlayer
+
+local history = {}
+local maxStored = REWIND_SECONDS * 60 
+local isRewinding = false
+
+
+getgenv().RewindScriptRunning = true
+
+
+getgenv().RewindConnection = RunService.Heartbeat:Connect(function()
+    if not getgenv().RewindScriptRunning then 
+        getgenv().RewindConnection:Disconnect()
+        return 
+    end
+
+    local char = player.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local hum = char and char:FindFirstChild("Humanoid")
+    local animateScript = char and char:FindFirstChild("Animate")
+
+    if not root or not hum or hum.Health <= 0 then
+        history = {}
+        return
+    end
+
+    if UIS:IsKeyDown(REWIND_KEY) then
+        isRewinding = true
+        
+        
+        for i = 1, REWIND_SPEED_MULTIPLIER do
+            if #history > 0 then
+                if animateScript then animateScript.Disabled = true end
+                
+                local snapshot = table.remove(history, #history)
+                
+                
+                if i == REWIND_SPEED_MULTIPLIER or #history == 0 then
+                    root.CFrame = root.CFrame:Lerp(snapshot.cf, 0.5)
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    
+                    for _, animData in pairs(snapshot.anims) do
+                        local track = animData.track
+                        if track then
+                            if not track.IsPlaying then track:Play(0) end
+                            track.TimePosition = animData.pos
+                            track:AdjustSpeed(0)
+                            track:AdjustWeight(animData.weight)
+                        end
+                    end
+                end
+            end
+        end
+    else
+        -- Clean up
+        if isRewinding then
+            isRewinding = false
+            if animateScript then animateScript.Disabled = false end
+            for _, track in pairs(hum:GetPlayingAnimationTracks()) do
+                track:Stop(0.1)
+                track:AdjustSpeed(1)
+            end
+        end
+
+        -- Recording
+        local currentAnims = {}
+        for _, track in pairs(hum:GetPlayingAnimationTracks()) do
+            if track.WeightCurrent > 0 then
+                table.insert(currentAnims, {
+                    track = track,
+                    pos = track.TimePosition,
+                    weight = track.WeightCurrent
+                })
+            end
+        end
+
+        table.insert(history, {
+            cf = root.CFrame,
+            anims = currentAnims
+        })
+        
+        if #history > maxStored then
+            table.remove(history, 1)
+        end
+    end
+end)
+			end,
+     	},
+		["rewindspeed"] = {
+			["ListName"] = "rewindspeed [frames to skip]",
+			["Description"] = "1 to skip no frames (default), 2 to skip to frames, 0 to break",
+			["Aliases"] = { "YOU GET NOTHING" },
+			["Function"] = function(args, speaker)
+local REWIND_SPEED_MULTIPLIER = args[1]
+			end,
+		},
+	},
+}
+
+return Plugin
+]],
+
+    ['timer manipulation.iy'] = [[
+-- v1.0.1
+
+local gameTimeSpeed = 1
+local timerConnection = nil
+
+local function say(msg)
+	task.spawn(function()
+		if notify then
+			pcall(notify, "Timer Manipulation", msg)
+		else
+			print("[Timer Manipulation] " .. msg)
+		end
+	end)
+end
+
+local function stopTimer()
+	gameTimeSpeed = 1
+	if timerConnection then
+		timerConnection:Disconnect()
+		timerConnection = nil
+	end
+	pcall(RunService.Run, RunService)
+end
+
+local function startTimer()
+	if timerConnection then
+		return
+	end
+
+	timerConnection = RunService.RenderStepped:Connect(function(dt)
+		if gameTimeSpeed <= 1 then return end
+
+		local char = Players.LocalPlayer.Character
+		if not char then return end
+
+		local root = getRoot(char)
+		if not root then return end
+
+		pcall(RunService.Pause, RunService)
+		local ok, err = pcall(workspace.StepPhysics, workspace, dt * (gameTimeSpeed - 1), { root })
+		pcall(RunService.Run, RunService)
+
+		if not ok then
+			warn("[Timer Manipulation] StepPhysics failed: " .. tostring(err))
+			stopTimer()
+		end
+	end)
+end
+
+local function setSpeed(value)
+	local speed = tonumber(value)
+	if not speed or speed <= 1 then
+		stopTimer()
+		say("Game speed reset to normal")
+		return
+	end
+
+	gameTimeSpeed = speed
+	startTimer()
+	say("Game speed changed to " .. tostring(speed))
+end
+
+local Plugin = {
+	["PluginName"] = "Timer Manipulation",
+	["PluginDescription"] = "Speeds up your character's physics time",
+	["Commands"] = {
+		["gamespeed"] = {
+			["ListName"] = "gamespeed / gs / timer [num]",
+			["Description"] = "Sets game speed (1 or empty resets to normal)",
+			["Aliases"] = {"gs", "timerspeed", "timer"},
+			["Function"] = function(args, speaker)
+				setSpeed(args[1])
+			end,
+		},
+		["ungamespeed"] = {
+			["ListName"] = "ungamespeed / ungs / untimer",
+			["Description"] = "Resets game speed to normal",
+			["Aliases"] = {"ungs", "untimerspeed", "untimer"},
+			["Function"] = function(args, speaker)
+				stopTimer()
+				say("Game speed reset to normal")
+			end,
+		},
+	},
+}
+
+return Plugin
+]],
+    ['Tooltip Fix.iy'] = [=[
+--[[
+    Fixes Infinite Yield's command list tooltip not showing on hover.
+
+    Why it breaks: IY's checkTT() finds the hovered command with
+        COREGUI:GetGuiObjectsAtPosition(IYMouse.X, IYMouse.Y)
+    but on executors that have gethui(), IY puts its whole GUI inside gethui(),
+    not CoreGui. CoreGui's lookup never returns IY's buttons, so the tooltip is
+    always hidden.
+
+    This plugin uses each command button's own MouseEnter / MouseLeave events,
+    so Roblox decides what's hovered (no top-bar inset math that can be off on
+    some setups). The tooltip follows the cursor like IY's original, takes IY's
+    guiscale into account, and grows to fit long descriptions.
+]]
+
+local RunService  = game:GetService("RunService")
+local TextService = game:GetService("TextService")
+
+local env = (getgenv and getgenv()) or _G
+
+-- IY's globals; plugins normally share IY's environment, getgenv is the fallback
+local function iy(name)
+    local ok, v = pcall(function() return getfenv(1)[name] end)
+    if ok and v ~= nil then return v end
+    return env[name]
+end
+
+-- stop a previous copy if the plugin gets reloaded
+local old = env.__iyTooltipFix
+if old then
+    if old.stop then pcall(old.stop) end
+    if old.conn then pcall(function() old.conn:Disconnect() end) end   -- first version of the plugin
+end
+local state = {}
+env.__iyTooltipFix = state
+
+local DESC_WIDTH, DESC_MIN_HEIGHT = 180, 72
+local TIP_WIDTH, MOUSE_GAP = 200, 21   -- same 21px cursor gap IY uses
+local TITLE_MIN_HEIGHT, TITLE_PAD = 20, 5   -- IY's title bar height; side padding so wrapped text doesn't touch the edges
+local DESC_OVERLAP = 2                      -- IY puts the description 2px up into the title bar (y = 18)
+
+-- true if obj and all its GuiObject ancestors are visible and its ScreenGui is enabled
+local function shownOnScreen(obj)
+    local node = obj
+    while node do
+        if node:IsA("GuiObject") and not node.Visible then return false end
+        if node:IsA("LayerCollector") then return node.Enabled end
+        node = node.Parent
+    end
+    return false
+end
+
+-- true if the row's center isn't clipped away (scrolled out / list minimized)
+local function rowOnScreen(row)
+    local c = row.AbsolutePosition + row.AbsoluteSize / 2
+    local node = row.Parent
+    while node and node:IsA("GuiObject") do
+        if node.ClipsDescendants then
+            local a, s = node.AbsolutePosition, node.AbsoluteSize
+            if c.X < a.X or c.Y < a.Y or c.X >= a.X + s.X or c.Y >= a.Y + s.Y then return false end
+        end
+        node = node.Parent
+    end
+    return true
+end
+
+local function start()
+    local cmdList, tooltip = iy("CMDsF"), iy("Tooltip")
+    local title, desc = iy("Title_3"), iy("Description")
+    if not (cmdList and tooltip and title and desc) then
+        warn("[Tooltip Fix] Couldn't find Infinite Yield's command list / tooltip")
+        return
+    end
+
+    local conns, disabled = {}, {}
+    local hovered = nil
+    local lastShown = nil
+    local mouse = iy("IYMouse") or game:GetService("Players").LocalPlayer:GetMouse()
+    -- correction if the mouse coords and the GUI disagree on the top-bar inset;
+    -- learned from the hovered row, since Roblox says the cursor is inside it
+    local calib = Vector2.zero
+
+    state.stop = function()
+        for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+        for _, c in ipairs(disabled) do pcall(function() c:Enable() end) end
+        table.clear(conns)
+        table.clear(disabled)
+    end
+
+    -- turn off IY's broken hover handler so it doesn't fight this one
+    local checkTT = iy("checkTT")
+    if getconnections and checkTT and mouse then
+        pcall(function()
+            for _, c in ipairs(getconnections(mouse.Move)) do
+                if c.Function == checkTT then
+                    c:Disable()
+                    table.insert(disabled, c)
+                end
+            end
+        end)
+    end
+
+    -- keep the tooltip above the command buttons
+    pcall(function()
+        tooltip.ZIndex = 12
+        title.ZIndex = 13
+        desc.ZIndex = 13
+    end)
+
+    -- long command names wrap onto more lines instead of running off the tooltip
+    pcall(function()
+        title.TextWrapped = true
+        if not title:FindFirstChild("TooltipFixPadding") then
+            local pad = Instance.new("UIPadding")
+            pad.Name = "TooltipFixPadding"
+            pad.PaddingLeft = UDim.new(0, TITLE_PAD)
+            pad.PaddingRight = UDim.new(0, TITLE_PAD)
+            pad.Parent = title
+        end
+    end)
+
+    local hooked = setmetatable({}, { __mode = "k" })
+    local function hook(btn)
+        if hooked[btn] or not btn:IsA("GuiButton") then return end
+        hooked[btn] = true
+        table.insert(conns, btn.MouseEnter:Connect(function() hovered = btn end))
+        table.insert(conns, btn.MouseLeave:Connect(function()
+            if hovered == btn then hovered = nil end
+        end))
+    end
+    for _, child in ipairs(cmdList:GetChildren()) do hook(child) end
+    -- plugin commands are added to the list later
+    table.insert(conns, cmdList.ChildAdded:Connect(hook))
+
+    -- RenderStepped runs after input each frame, so this wins over IY's handler
+    -- even on executors without getconnections
+    table.insert(conns, RunService.RenderStepped:Connect(function()
+        if not cmdList.Parent or not tooltip.Parent then
+            state.stop()
+            return
+        end
+
+        local row = hovered
+        if not (row and row.Parent == cmdList and row.Visible
+            and row:GetAttribute("Title") ~= nil
+            and shownOnScreen(cmdList) and rowOnScreen(row)) then
+            tooltip.Visible = false
+            lastShown = nil
+            return
+        end
+
+        local container = tooltip.Parent
+        local scale = 1
+        local uiScale = container:FindFirstChildOfClass("UIScale")
+        if uiScale and uiScale.Scale > 0 then scale = uiScale.Scale end
+
+        -- text and height only change when the hovered command changes
+        if row ~= lastShown then
+            lastShown = row
+            local titleText = tostring(row:GetAttribute("Title") or "")
+            local descText = tostring(row:GetAttribute("Desc") or "")
+            title.Text = titleText
+            desc.Text = descText
+
+            -- title bar grows for names that wrap onto more lines
+            local th = TITLE_MIN_HEIGHT
+            local okT, tSize = pcall(TextService.GetTextSize, TextService,
+                titleText, title.TextSize, title.Font, Vector2.new(TIP_WIDTH - TITLE_PAD * 2, 10000))
+            if okT then th = math.max(TITLE_MIN_HEIGHT, tSize.Y + 6) end
+            title.Size = UDim2.new(0, TIP_WIDTH, 0, th)
+
+            local h = DESC_MIN_HEIGHT
+            local ok, size = pcall(TextService.GetTextSize, TextService,
+                descText, desc.TextSize, desc.Font, Vector2.new(DESC_WIDTH, 10000))
+            if ok then h = math.max(DESC_MIN_HEIGHT, size.Y + 4) end
+            local descTop = th - DESC_OVERLAP
+            desc.Position = UDim2.new(0, 10, 0, descTop)
+            desc.Size = UDim2.new(0, DESC_WIDTH, 0, h)
+            tooltip.Size = UDim2.new(0, TIP_WIDTH, 0, descTop + h + 6)
+        end
+
+        -- cursor position in the GUI's AbsolutePosition space
+        local p = Vector2.new(mouse.X, mouse.Y) + calib
+        local rp, rs = row.AbsolutePosition, row.AbsoluteSize
+        local fixX = (p.X < rp.X and rp.X - p.X) or (p.X >= rp.X + rs.X and rp.X + rs.X - 1 - p.X) or 0
+        local fixY = (p.Y < rp.Y and rp.Y - p.Y) or (p.Y >= rp.Y + rs.Y and rp.Y + rs.Y - 1 - p.Y) or 0
+        if fixX ~= 0 or fixY ~= 0 then
+            calib += Vector2.new(fixX, fixY)
+            p += Vector2.new(fixX, fixY)
+        end
+
+        local tipW = tooltip.Size.X.Offset * scale
+        local tipH = tooltip.Size.Y.Offset * scale
+        local origin, view = container.AbsolutePosition, container.AbsoluteSize
+
+        -- same placement rules as IY's checkTT: left of the cursor, or right of it
+        -- if there's no room on the left; flip up near the bottom of the screen
+        local x
+        if p.X - origin.X > tipW then
+            x = p.X - tipW - 1
+        else
+            x = p.X + MOUSE_GAP * scale
+        end
+        local y = p.Y
+        if p.Y > origin.Y + view.Y - tipH then
+            y = p.Y - tipH - 1
+        end
+        y = math.max(origin.Y, y)
+
+        tooltip.Position = UDim2.fromOffset((x - origin.X) / scale, (y - origin.Y) / scale)
+        tooltip.Visible = true
+    end))
+end
+
+-- apply as soon as the plugin loads
+task.defer(start)
+
+return {
+    ["PluginName"] = "Tooltip Fix",
+    ["PluginDescription"] = "Fixes command descriptions not showing when hovering the command list.",
+    ["Commands"] = {},
+}
+
+]=],
+    ['uwuify.iy'] = [[
+local textChatService = game:GetService("TextChatService")
+local chatChannel = textChatService.TextChannels.RBXGeneral
+local chatConnection = nil
+
+local isAutoCutie = false
+local speakerUserId = nil
+
+-- cant figure out a way to intercept (or at least stop) msg before firing so...
+-- + let the server be with the og msg
+-- + from msg back, we uwuify and fire out
+
+local function uwuifyString(input, speaker)
+	local result = input
+	local seed = os.time()
+	math.randomseed(seed)
+
+	result = string.gsub(result, "r", "w")
+	result = string.gsub(result, "R", "W")
+	result = string.gsub(result, "l", "w")
+	result = string.gsub(result, "L", "W")
+	result = string.gsub(result, "n", "ny")
+	result = string.gsub(result, "N", "Ny")
+	result = string.gsub(result, "ove", "uv")
+	result = string.gsub(result, "OVE", "UV")
+	result = string.gsub(result, "th", "d")
+	result = string.gsub(result, "Th", "D")
+	result = string.gsub(result, "TH", "D")
+	result = string.gsub(result, "v", "w")
+	result = string.gsub(result, "V", "W")
+	result = string.gsub(result, "you", "youw")
+	result = string.gsub(result, "You", "Youw")
+
+	local chars = {}
+	for i = 1, #result do
+		table.insert(chars, result:sub(i, i))
+		if math.random() > 0.7 and result:sub(i, i):match("[a-zA-Z]") then
+			-- ad-add p-pa-pauses int-o output l-lik-like th-thisssss
+			table.insert(chars, result:sub(i, i) .. "-")
+		end
+	end
+	result = table.concat(chars)
+
+	local affixes = {
+		" :3",
+		" >:3",
+		" :333",
+		" :3c",
+		"!11!!",
+		"!!!!",
+		"!!!",
+		"~~",
+		"!!??!",
+		"?!?!??",
+		" >w<",
+		" >.<",
+		" owo",
+		" OwO",
+		" UwU",
+		" nyaa~",
+		" ^w^",
+		" <3",
+		" x3",
+		" muah~",
+		" :D",
+		" hehe",
+		" rawr",
+		" prrr~",
+		" ✧w✧",
+		" hehehehe",
+		" chu~",
+		" ~nya",
+		" kawaii~",
+		" yay!!",
+		" :DD",
+		" *excited noises*",
+		" wheee~~",
+		" eheheheheheheh!",
+		" heheheheh!!",
+		" uheheheheheh!!",
+		" uehh",
+	}
+	result = result .. affixes[math.random(#affixes)]
+
+	return result
+end
+
+local function sendMessage(message)
+	textChatService.TextChannels.RBXGeneral:SendAsync(message)
+end
+
+local function onChatEvent(state)
+	if state then
+		local alreadySentUwuified = false
+		chatConnection = chatChannel.MessageReceived:Connect(function(messageObject)
+			if not messageObject.TextSource or messageObject.TextSource.UserId ~= speakerUserId then
+				return
+			end
+			if alreadySentUwuified then
+				alreadySentUwuified = false
+				return
+			end
+			if isAutoCutie then
+				local original = messageObject.Text or ""
+				local cutified = uwuifyString(original)
+				if cutified ~= original then
+					alreadySentUwuified = true
+					chatChannel:SendAsync(cutified)
+				end
+			end
+		end)
+	else
+		if chatConnection then
+			chatConnection:Disconnect()
+			chatConnection = nil
+		end
+	end
+end
+
+local Plugin = {
+	["PluginName"] = "uwuify (formerly cutestring)",
+	["PluginDescription"] = "format chat with cute uwu!!11~",
+	["Commands"] = {
+		["uwuify"] = {
+			["ListName"] = "uwuify [string] / cuteify [string]",
+			["Description"] = "makes a string cute",
+			["Aliases"] = { "cuteify", "cutestring" },
+			["Function"] = function(args, speaker)
+				speakerUserId = speaker.UserId
+				local output = uwuifyString(table.concat(args, " ") or args[1])
+				if output then
+					sendMessage(output)
+					-- if setclipboard and type(setclipboard) == "function" then
+					-- 	setclipboard(output)
+					-- 	-- literally only sirhurt has this, hallo??
+					-- end
+				else
+					notify("no output to send")
+				end
+			end,
+		},
+		["autouwuify"] = {
+			["ListName"] = "autouwuify [boolean?]",
+			["Description"] = "toggle uwuify per chat message >:3c",
+			["Aliases"] = { "autocutie", "autouwu", "autocutestring" },
+			["Function"] = function(args, speaker)
+				speakerUserId = speaker.UserId
+				local toggle = (args[1] or ""):lower()
+				if toggle == "true" then
+					isAutoCutie = true
+					onChatEvent(true)
+					notify(
+						"auto-cutie mode on  (warn: original msg will be sent along, use uwuify instead if ure not lazy)"
+					)
+				elseif toggle == "false" then
+					isAutoCutie = false
+					onChatEvent(false)
+					notify("auto-cutie mode off")
+				else
+					isAutoCutie = not isAutoCutie
+					onChatEvent(isAutoCutie)
+					notify(
+						`auto-cutie mode toggled {isAutoCutie and "on  (warn: original msg will be sent along, use uwuify instead if ure not lazy)" or "off"}`
+					)
+				end
+			end,
+		},
+	},
+}
+
+return Plugin
+
+]],
+    ['wfcp.iy'] = [[
+local Plugin = {
+    ["PluginName"] = "WFCP",
+    ["PluginDescription"] = "camera stuff i guess",
+    ["Commands"] = {
+        ["freemouse"] = {
+            ["ListName"] = "freemouse / unlockmouse",
+            ["Description"] = "ugh my mouse is in the middle of the screen and there's shit blocking my goddamn way",
+            ["Aliases"] = {"unlockmouse"},
+            ["Function"] = function(args, speaker)
+                _G.MouseUnlocked = not _G.MouseUnlocked
+            end
+        },
+        ["hideacc"] = {
+            ["ListName"] = "hideacc / accessories",
+            ["Description"] = "hides accessories for my fp",
+            ["Aliases"] = {"accessories"},
+            ["Function"] = function(args, speaker)
+                local Player = game:GetService("Players").LocalPlayer
+                local RunService = game:GetService("RunService")
+                _G.AccHidden = not _G.AccHidden
+                if _G.AccConnection then 
+                    _G.AccConnection:Disconnect() 
+                    _G.AccConnection = nil 
+                end
+                if _G.AccHidden then
+                    _G.AccConnection = RunService.RenderStepped:Connect(function()
+                        local char = Player.Character
+                        if char then
+                            for _, v in pairs(char:GetChildren()) do
+                                if v:IsA("Accessory") then
+                                    local p = v:FindFirstChildOfClass("Part") or v:FindFirstChildOfClass("MeshPart")
+                                    if p then
+                                        p.LocalTransparencyModifier = 1
+                                        p.Transparency = 1
+                                    end
+                                end
+                            end
+                        end
+                    end)
+                else
+                    local char = Player.Character
+                    if char then
+                        for _, v in pairs(char:GetChildren()) do
+                            if v:IsA("Accessory") then
+                                local p = v:FindFirstChildOfClass("Part") or v:FindFirstChildOfClass("MeshPart")
+                                if p then
+                                    p.LocalTransparencyModifier = 0
+                                    p.Transparency = 0
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        },
+        ["backview"] = {
+            ["ListName"] = "rearview / rear / f5",
+            ["Description"] = "flips camera 180 degrees and inverts controls to look behind you in regular tp",
+            ["Aliases"] = {"rear", "f5"},
+            ["Function"] = function(args, speaker)
+                local Camera = workspace.CurrentCamera
+                local Players = game:GetService("Players")
+                local RunService = game:GetService("RunService")
+                local UIS = game:GetService("UserInputService")
+                local Player = Players.LocalPlayer
+                if _G.RearViewActive then
+                    _G.RearViewActive = false
+                    Player.DevEnableMouseLock = _G.PrevMouseLock
+                    Player.CameraMinZoomDistance = _G.PrevMinZoom
+                    Player.DevComputerMovementMode = Enum.DevComputerMovementMode.UserChoice
+                    local focus = Camera.Focus.Position
+                    local offset = Camera.CFrame.Position - focus
+                    local rotatedOffset = CFrame.Angles(0, math.pi, 0) * offset
+                    Camera.CFrame = CFrame.lookAt(focus + rotatedOffset, focus)
+                    return
+                end
+                _G.PrevMouseLock = Player.DevEnableMouseLock
+                _G.PrevMinZoom = Player.CameraMinZoomDistance
+                _G.RearViewActive = true
+                Player.DevEnableMouseLock = false
+                Player.CameraMinZoomDistance = 5
+                local focus = Camera.Focus.Position
+                local offset = Camera.CFrame.Position - focus
+                local rotatedOffset = CFrame.Angles(0, math.pi, 0) * offset
+                Camera.CFrame = CFrame.lookAt(focus + rotatedOffset, focus)
+                local Connection
+                Connection = RunService.RenderStepped:Connect(function()
+                    local char = Player.Character
+                    local Hum = char and char:FindFirstChildOfClass("Humanoid")
+                    local Root = char and char:FindFirstChild("HumanoidRootPart")
+                    if _G.RearViewActive and Hum and Root then
+                        Player.DevComputerMovementMode = Enum.DevComputerMovementMode.Scriptable
+                        local MoveVec = Vector3.new(0, 0, 0)
+                        if UIS:IsKeyDown(Enum.KeyCode.S) then MoveVec = MoveVec + Vector3.new(0, 0, -1) end
+                        if UIS:IsKeyDown(Enum.KeyCode.W) then MoveVec = MoveVec + Vector3.new(0, 0, 1) end
+                        if UIS:IsKeyDown(Enum.KeyCode.D) then MoveVec = MoveVec + Vector3.new(-1, 0, 0) end
+                        if UIS:IsKeyDown(Enum.KeyCode.A) then MoveVec = MoveVec + Vector3.new(1, 0, 0) end
+                        Hum:Move(MoveVec, true)
+                    else
+                        _G.RearViewActive = false
+                        Connection:Disconnect()
+                    end
+                end)
+            end
+        },
+        ["worldmodelfp"] = {
+            ["ListName"] = "worldmodelfp / fp / realfirstperson",
+            ["Description"] = "my custom fp",
+            ["Aliases"] = {"fp", "realfirstperson"},
+            ["Function"] = function(args, speaker)
+                local Players = game:GetService("Players")
+                local RunService = game:GetService("RunService")
+                local UIS = game:GetService("UserInputService")
+                local Camera = workspace.CurrentCamera
+                local Player = Players.LocalPlayer
+                
+                if _G.WMActive then
+                    _G.WMActive = false
+                    _G.MouseUnlocked = false
+                    return
+                end
+                
+                _G.WMActive = true
+                _G.MouseUnlocked = false
+                _G.WMYaw = 0
+                _G.WMPitch = 0
+                local currentZ = -0.1
+                
+                if _G.WMConnection then 
+                    _G.WMConnection:Disconnect() 
+                end
+                
+                _G.WMConnection = RunService.RenderStepped:Connect(function()
+                    if not _G.WMActive then
+                        Camera.CameraType = Enum.CameraType.Custom
+                        UIS.MouseBehavior = Enum.MouseBehavior.Default
+                        local char2 = Player.Character
+                        if char2 then
+                            local head2 = char2:FindFirstChild("Head")
+                            if head2 then head2.LocalTransparencyModifier = 0 end
+                        end
+                        _G.WMConnection:Disconnect()
+                        _G.WMConnection = nil
+                        return
+                    end
+                    
+                    local char = Player.Character
+                    local Root = char and char:FindFirstChild("HumanoidRootPart")
+                    local Head = char and char:FindFirstChild("Head")
+                    
+                    if Root and Head then
+                        if Camera.CameraType ~= Enum.CameraType.Scriptable then
+                            Camera.CameraType = Enum.CameraType.Scriptable
+                        end
+                        
+                        -- Mouse unlock logic with right-click drag support
+                        if _G.MouseUnlocked and not UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+                            UIS.MouseBehavior = Enum.MouseBehavior.Default
+                        else
+                            UIS.MouseBehavior = Enum.MouseBehavior.LockCenter
+                            local Delta = UIS:GetMouseDelta()
+                            _G.WMYaw = _G.WMYaw - (Delta.X * 0.008)
+                            _G.WMPitch = math.clamp(_G.WMPitch - (Delta.Y * 0.008), -1.48, 1.48)
+                        end
+                        
+                        Root.CFrame = CFrame.new(Root.Position) * CFrame.Angles(0, _G.WMYaw, 0)
+                        
+                        local headRotation = Head.CFrame - Head.Position
+                        local _, _, roll = headRotation:ToEulerAnglesYXZ()
+                        if math.abs(_G.WMPitch) > 1.4 then
+                            roll = roll * (1.5 - math.abs(_G.WMPitch)) * 10
+                        end
+                        
+                        local pitchFactor = math.clamp(-_G.WMPitch, 0, 1.48) / 1.48
+                        local targetZ = -0.1 - (pitchFactor * 0.25)
+                        currentZ = currentZ + (targetZ - currentZ) * 0.1
+                        
+                        local finalRot = CFrame.Angles(0, _G.WMYaw, 0) * CFrame.Angles(_G.WMPitch, 0, roll)
+                        Camera.CFrame = CFrame.new(Head.Position) * finalRot * CFrame.new(0, 0.25, currentZ)
+                        Head.LocalTransparencyModifier = 1
+                    else
+                        Camera.CameraType = Enum.CameraType.Custom
+                        UIS.MouseBehavior = Enum.MouseBehavior.Default
+                    end
+                end)
+            end
+        },
+        ["frontview"] = {
+            ["ListName"] = "frontview / resetcam",
+            ["Description"] = "perfectly level camera",
+            ["Aliases"] = {"resetcam"},
+            ["Function"] = function(args, speaker)
+                local Players = game:GetService("Players")
+                local Camera = workspace.CurrentCamera
+                local Player = Players.LocalPlayer
+                local char = Player.Character
+                local Root = char and char:FindFirstChild("HumanoidRootPart")
+                _G.RearViewActive = false
+                _G.WMActive = false
+                _G.MouseUnlocked = false
+                Player.DevComputerMovementMode = Enum.DevComputerMovementMode.UserChoice
+                Player.DevEnableMouseLock = true
+                Player.CameraMinZoomDistance = 0.5
+                if Root then
+                    Camera.CameraType = Enum.CameraType.Custom
+                    local LookPos = Root.CFrame:PointToWorldSpace(Vector3.new(0, 2, -15))
+                    local CamPos = Root.CFrame:PointToWorldSpace(Vector3.new(0, 2, 12))
+                    Camera.CFrame = CFrame.new(CamPos, LookPos)
+                end
+            end
+        }
+    }
+}
+return Plugin
+]],
+    ['mfreecam.iy'] = [=[
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -11935,423 +14018,7 @@ local Plugin = {
 }
 
 return Plugin
-]],
-    ['minigun.iy'] = [=[
---[[
-	minigun.iy  --  Infinite Yield plugin
-
-	Fires hotbar slots 1 -> 0 in order: equips whatever tool the hotbar shows
-	in that slot and activates it, pausing a fixed delay between each.
-
-	Commands
-		minigun [ms] [slots]   start (ms default 100, slots default 10)
-		minigunstop           stop the loop
-		minigunrefresh        re-read the hotbar and rebind slots
-		minigunstatus         print current state
-
-	"ms" is entered in milliseconds, e.g. `minigun 100 10` is slots 1-0 at
-	100ms each. "slots" can only go DOWN from 10 -- it can never exceed the
-	ten keys.
-
-	Ordering
-		Slot contents come from the CoreGui hotbar (Backpack child order is NOT
-		slot order in this game). Each slot index is bound ONCE to a Tool
-		instance and that binding is held for the whole run, so the cycle
-		always goes 1 -> 2 -> ... -> 9 -> 0.
-
-		Equipping is not always immediate, so a slot waits briefly for its
-		tool to actually reach the character before activating. Without that
-		wait roughly one slot in eight was skipped every pass, which read as
-		the cycle jumping around.
-
-	Command replies go to IY's console AND as a toast notification.
-
-	Live state is shared on getgenv().MINIGUN. Reloading the plugin stops any
-	loop left running by the previous load, so ;minigunstop always works.
-]]
-
-local Players = game:GetService("Players")
-local CoreGui = game:GetService("CoreGui")
-local LocalPlayer = Players.LocalPlayer
-
-local SLOT_NAMES = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}
-
-local DEFAULT_INTERVAL = 0.1
-local DEFAULT_MS = DEFAULT_INTERVAL * 1000
-local DEFAULT_SLOTS = 10
-local EQUIP_GRACE = 0.06 -- seconds to wait for an equip to land
-
-local env = (getgenv and getgenv()) or _G
-local state = env.MINIGUN
-if type(state) ~= "table" then state = {} end
-state.running = false
-state.fired = 0
-state.ticks = 0
-state.cycles = 0
-state.interval = state.interval or DEFAULT_INTERVAL
-state.slotCount = state.slotCount or 0
-state.source = state.source or "none"
-state.lastTool = state.lastTool or "none"
-state.slots = state.slots or {}
-state.missed = 0
-state.error = ""
-env.MINIGUN = state
-
--- slot index -> Tool, bound once and held for the whole run
-local bindings = {}
-
-local function publish()
-	state.bindTools = bindings
-	state.slotCount = 0
-	state.slots = {}
-	for i, tool in ipairs(bindings) do
-		state.slotCount = i
-		state.slots[i] = tool and tool.Name or "?"
-	end
-end
-
-local function log(msg)
-	local text = "[minigun] " .. tostring(msg)
-	if type(env.printconsole) == "function" then
-		pcall(env.printconsole, text)
-	else
-		print(text)
-	end
-end
-
-local function tell(msg)
-	local text = "[minigun] " .. tostring(msg)
-	if type(env.printconsole) == "function" then
-		pcall(env.printconsole, text)
-	else
-		print(text)
-	end
-	if type(env.notify) == "function" then
-		pcall(env.notify, text)
-	end
-	return text
-end
-
-local function getBackpack()
-	return LocalPlayer:FindFirstChildOfClass("Backpack")
-end
-
-local function getHumid()
-	local char = LocalPlayer.Character
-	if not char then return nil, nil end
-	return char, char:FindFirstChildOfClass("Humanoid")
-end
-
-local function isAlive(tool)
-	return tool ~= nil and tool.Parent ~= nil and tool:IsDescendantOf(LocalPlayer)
-end
-
--- Backpack children first, in order, then anything in hand.
-local function toolPool()
-	local pool, seen = {}, {}
-	local function add(inst)
-		if inst and inst:IsA("Tool") and not seen[inst] then
-			seen[inst] = true
-			table.insert(pool, inst)
-		end
-	end
-	local backpack = getBackpack()
-	if backpack then
-		for _, child in ipairs(backpack:GetChildren()) do add(child) end
-	end
-	local char = LocalPlayer.Character
-	if char then
-		for _, child in ipairs(char:GetChildren()) do add(child) end
-	end
-	return pool
-end
-
-local function readHotbarNames()
-	local robloxGui = CoreGui:FindFirstChild("RobloxGui")
-	local backpackFrame = robloxGui and robloxGui:FindFirstChild("Backpack")
-	local hotbar = backpackFrame and backpackFrame:FindFirstChild("Hotbar")
-	if not hotbar then return nil end
-	local names = {}
-	for _, slotName in ipairs(SLOT_NAMES) do
-		local slot = hotbar:FindFirstChild(slotName)
-		local label = slot and slot:FindFirstChild("ToolName")
-		local text = label and label.Text or ""
-		if text == "" then break end
-		table.insert(names, text)
-		if #names >= DEFAULT_SLOTS then break end
-	end
-	return names
-end
-
--- Bind hotbar slots to Tool instances. Only fills slots that are unbound or
--- whose tool has gone away, so slot order never shifts mid-run.
-local function bindSlots(force)
-	local names = readHotbarNames()
-
-	if force then
-		for i = #bindings, 1, -1 do bindings[i] = nil end
-	end
-
-	if not names or #names == 0 then
-		if #bindings == 0 then
-			local pool = toolPool()
-			for i = 1, math.min(#pool, DEFAULT_SLOTS) do bindings[i] = pool[i] end
-		end
-		state.source = "backpack order (hotbar unavailable)"
-		publish()
-		return bindings
-	end
-
-	-- a slot keeps its tool for the whole run; drop only dead ones
-	local taken = {}
-	for i = #bindings, 1, -1 do
-		if isAlive(bindings[i]) then taken[bindings[i]] = true else bindings[i] = nil end
-	end
-
-	local pool = toolPool()
-	for i = #names, 1, -1 do
-		if not isAlive(bindings[i]) then
-			for _, tool in ipairs(pool) do
-				if tool.Name == names[i] and not taken[tool] then
-					bindings[i] = tool
-					taken[tool] = true
-					break
-				end
-			end
-		end
-	end
-	for i = #names + 1, #bindings do bindings[i] = nil end
-
-	state.source = "hotbar slots 1-0"
-	publish()
-	return bindings
-end
-
-local function orderedTools(limit)
-	local list = {}
-	for i = 1, math.min(#bindings, limit) do
-		if isAlive(bindings[i]) then table.insert(list, bindings[i]) end
-	end
-	return list
-end
-
-local function fire(tool, char, hum)
-	pcall(function() hum:EquipTool(tool) end)
-	if tool.Parent ~= char then
-		-- EquipTool is not always synchronous; give it a moment to land
-		local deadline = os.clock() + EQUIP_GRACE
-		while tool.Parent ~= char and os.clock() < deadline do
-			task.wait()
-		end
-	end
-	if tool.Parent == char then
-		pcall(function() tool:Activate() end)
-		state.fired += 1
-		state.lastTool = tool.Name
-		return true
-	end
-	state.missed += 1
-	return false
-end
-
-local function run(interval, slotsArg)
-	local limit = math.clamp(math.floor(tonumber(slotsArg) or DEFAULT_SLOTS), 1, DEFAULT_SLOTS)
-	while state.running do
-		state.ticks += 1
-		local ok, err = pcall(function()
-			local char, hum = getHumid()
-			if not hum or hum.Health <= 0 then
-				task.wait(0.5)
-				return
-			end
-			bindSlots(false)
-			local tools = orderedTools(limit)
-			if #tools == 0 then
-				task.wait(0.5)
-				return
-			end
-			for _, tool in ipairs(tools) do
-				if not state.running then break end
-				if isAlive(tool) and hum.Health > 0 then
-					fire(tool, char, hum)
-				end
-				task.wait(interval)
-			end
-			state.cycles += 1
-		end)
-		if not ok then
-			state.error = tostring(err)
-			log("error: " .. state.error)
-		end
-	end
-end
-
-local function slotText()
-	local names = {}
-	for i, n in ipairs(state.slots or {}) do
-		table.insert(names, i .. "=" .. tostring(n))
-	end
-	if #names == 0 then return "none" end
-	return table.concat(names, "  ")
-end
-
-local function statusLine()
-	return ("running=%s  activations=%d  missed=%d  ticks=%d  cycles=%d  slots=%d  interval=%.0fms  last=%s  source=%s  error=%s")
-		:format(tostring(state.running), state.fired, state.missed, state.ticks, state.cycles,
-			state.slotCount, state.interval * 1000, tostring(state.lastTool), tostring(state.source),
-			state.error == "" and "none" or state.error)
-end
-
-local function stop()
-	if not state.running then
-		tell("not running")
-		return
-	end
-	state.running = false
-	tell("stopped after " .. state.fired .. " activations (" .. state.missed .. " missed)")
-end
-
-local function start(interval, slotsArg)
-	if state.running then
-		tell("already running -- use minigunstop first")
-		return
-	end
-	interval = tonumber(interval) or DEFAULT_INTERVAL
-	if interval < 0.01 then interval = 0.01 end
-	bindSlots(true)
-	if #bindings == 0 then
-		tell("no tools found in hotbar slots 1-0")
-		return
-	end
-	state.interval = interval
-	state.fired = 0
-	state.missed = 0
-	state.ticks = 0
-	state.cycles = 0
-	state.running = true
-	task.spawn(run, interval, slotsArg)
-	tell(("started: %d slot(s) from %s at %.0fms  |  %s")
-		:format(#bindings, state.source, interval * 1000, statusLine()))
-end
-
-local Plugin = {
-	["PluginName"] = "minigun",
-	["PluginDescription"] = "Fires hotbar slots 1-0 in order with a fixed delay between each.",
-	["Commands"] = {
-		["minigun"] = {
-			["ListName"] = "minigun [ms] [slots]",
-			["Description"] = "Starts firing hotbar slots 1-0 in order. ms = delay between each in milliseconds (default 100). slots = how many of the 10 to use (default 10, max 10).",
-			["Aliases"] = {"mg", "spin"},
-			["Function"] = function(args)
-				local interval = (tonumber(args[1]) or DEFAULT_MS) / 1000
-				start(interval, args[2])
-			end,
-		},
-		["minigunstop"] = {
-			["ListName"] = "minigunstop",
-			["Description"] = "Stops the minigun loop.",
-			["Aliases"] = {"stopminigun", "mgstop"},
-			["Function"] = function(args)
-				stop()
-			end,
-		},
-		["minigunrefresh"] = {
-			["ListName"] = "minigunrefresh",
-			["Description"] = "Re-reads hotbar slots 1-0 and rebinds them from scratch.",
-			["Aliases"] = {"mgrefresh"},
-			["Function"] = function(args)
-				bindSlots(true)
-				tell(("hotbar 1-0 (%s, %d bound): %s")
-					:format(state.source, #bindings, slotText()))
-			end,
-		},
-		["minigunstatus"] = {
-			["ListName"] = "minigunstatus",
-			["Description"] = "Shows whether the minigun is running, and what is bound to each slot.",
-			["Aliases"] = {"mgstatus"},
-			["Function"] = function(args)
-				if #bindings == 0 then bindSlots(true) end
-				tell(statusLine())
-				log("slot order: " .. slotText())
-			end,
-		},
-	}
-}
-
-return Plugin
 ]=],
-    ['mousetools.iy'] = [[
-local defaults = {}
-
-local Plugin = {
-    ["PluginName"] = "Mouse Tools",
-    ["PluginDescription"] = "Adds various commands for modifying the in game mouse or restoring it to Roblox defaults.",
-    ["Commands"] = {
-        ["showcursor"] = {
-            ["ListName"] = "showcursor / showmouse",
-            ["Description"] = "Unhides the mouse in most games. If this doesn't work, try 'defaultcursor'",
-            ["Aliases"] = {"showmouse", "mouse"},
-            ["Function"] = function(args, speaker)
-                defaults.MouseIconEnabled = UserInputService.MouseIconEnabled
-                UserInputService.MouseIconEnabled = true
-                
-                if args[1] ~= "notify" then notify("Mouse Enabled", "Mouse is now enabled") end
-            end
-        },
-
-        ["unlockcursor"] = {
-            ["ListName"] = "unlockcursor / unlockmouse",
-            ["Description"] = "Unlocks the mouse cursor. Additionally unhides it if it's hidden",
-            ["Aliases"] = {"unlockcursor", "umouse", "ucur"},
-            ["Function"] = function(args, speaker)
-                execCmd("showmouse nonotify")
-                defaults.MouseBehavior = UserInputService.MouseBehavior
-                UserInputService.MouseBehavior = Enum.MouseBehavior.Default
-
-                if args[1] ~= "nonotify" then notify("Unlocked", "Mouse has been unlocked") end
-            end
-        },
-
-        ["lockcursor"] = {
-            ["ListName"] = "lockcursor / centercursor",
-            ["Description"] = "Locks the mouse cursor to the center of the screen",
-            ["Aliases"] = {"centercursor", "centermouse"},
-            ["Function"] = function(args, speaker)
-                defaults.MouseBehavior = UserInputService.MouseBehavior
-                UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
-
-                if args[1] ~= "nonotify" then notify("Locked", "Mouse has been locked") end
-            end
-        },
-
-        ["defaultcursor"] = {
-            ["ListName"] = "defaultcursor / dcursor",
-            ["Description"] = "Restores the cursor to Roblox defaults. Useful for games that modify it so it's hard to use",
-            ["Aliases"] = {"defaultmouse", "defaultcursor", "defcursor", "defcur", "dcursor", "dfcur", "restorecursor", "rscur"},
-            ["Function"] = function(args, speaker)
-                execCmd("unlockmouse nonotify")
-                defaults.MouseIcon = UserInputService.MouseIcon
-
-                if args[1] ~= "nonotify" then notify("Restored Cursor", "Restored the cursor to Roblox defaults") end
-            end
-        },
-
-        ["gamecursor"] = {
-            ["ListName"] = "gamecursor / gcursor",
-            ["Description"] = "Reverts changes made by the plugin to the mouse",
-            ["Aliases"] = {"gamemouse", "gmouse", "gcursor", "gamecur", "gcur"},
-            ["Function"] = function(args, speaker)
-                for prop, val in next, defaults do UserInputService[prop] = val end
-                table.clear(defaults)
-
-                if args[1] ~= "nonotify" then notify("Restored Cursor", "Restored the cursor to game defaults") end
-            end
-        }
-    }
-}
-
-return Plugin
-]],
 }
 local function LoadEmbeddedIYPlugin(filename)
     local source = EmbeddedIYPlugins[filename]
@@ -12364,6 +14031,10 @@ end
 
 local PluginCache
 function LoadPlugin(val,startup)
+	if type(val) == "string" then
+		local pluginName = val:gsub("\\", "/"):match("([^/]+)$"):lower()
+		if pluginName == "ppgoto.iy" or pluginName == "mousetptween.iy" or pluginName == "sigmasedit.iy" or pluginName == "aimbot.iy" or pluginName == "mousetools.iy" then return end
+	end
 	local plugin
 
 	function CatchedPluginLoad()
@@ -12396,7 +14067,6 @@ function LoadPlugin(val,startup)
 			notify('Loaded Plugin',"Name: "..plugin["PluginName"].."\n".."Description: "..plugin["PluginDescription"])
 		end
 		addcmdtext('',val)
-		addcmdtext(string.upper('--'..plugin["PluginName"]),val,plugin["PluginDescription"])
 		if plugin["Commands"] then
 			for i,v in pairs(plugin["Commands"]) do 
 				local cmdExt = ''
